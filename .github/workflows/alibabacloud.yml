@@ -1,0 +1,146 @@
+# This workflow will build and push a new container image to Alibaba Cloud Container Registry (ACR),
+# and then will deploy it to Alibaba Cloud Container Service for Kubernetes (ACK), when there is a push to the "master" branch.
+#
+# To use this workflow, you will need to complete the following set-up steps:
+#
+# 1. Create an ACR repository to store your container images.
+#    You can use ACR EE instance for more security and better performance.
+#    For instructions see https://www.alibabacloud.com/help/doc-detail/142168.htm
+#
+# 2. Create an ACK cluster to run your containerized application.
+#    You can use ACK Pro cluster for more security and better performance.
+#    For instructions see https://www.alibabacloud.com/help/doc-detail/95108.htm
+#
+# 3. Store your AccessKey pair in GitHub Actions secrets named `ACCESS_KEY_ID` and `ACCESS_KEY_SECRET`.
+#    For instructions on setting up secrets see: https://developer.github.com/actions/managing-workflows/storing-secrets/
+#
+# 4. Change the values for the REGION_ID, REGISTRY, NAMESPACE, IMAGE, ACK_CLUSTER_ID, and ACK_DEPLOYMENT_NAME.
+#
+ 
+name: Build and Deploy to ACK
+
+on:
+  push:
+    branches: [ "master" ]
+
+env:
+  TAG: ${{ github.sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+      attestations: write
+      id-token: write
+
+    steps:
+      # 0.0 Action for checking out a repo
+      # 0.0 从Git仓库获取必要文件到ubuntu-latest系统中
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # 0.1 Add env
+      # 0.1 添加环境变量
+      - name: add env
+        uses: aarcangeli/load-dotenv@v1 
+        with:
+          path: ./.github/workflows
+          filename: .env
+
+      - name: printenv
+        run: |
+          printenv
+
+
+      # 1.1A Login to Docker Hub
+      # 1.1A 登入docker hub仓库
+      - name: Log in to Docker Hub
+        if: ${{   env.PUSH_REGISTRY_KIND == 'docker' ||   env.PUSH_REGISTRY_KIND == 'all' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # 1.1B Login to ACR
+      # 1.1B Login to 阿里云ACR仓库
+      - name: Login to ACR with the AccessKey pair
+        if: ${{   env.PUSH_REGISTRY_KIND == 'ali' ||   env.PUSH_REGISTRY_KIND == 'all' }}
+        uses: aliyun/acr-login@v1
+        with:
+          login-server: "${{ env.INSTANCE_ID }}.${{ env.REGISTRY }}" # default: https://index.docker.io/v1/
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+
+      #1.2 Extract metadata for Docker
+      #1.2 提取docker镜像元数据
+      - name: Extract metadata (tags, labels) for Docker
+        if: ${{   env.PUSH_REGISTRY_KIND == 'docker' ||   env.PUSH_REGISTRY_KIND == 'all' }}
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: "${{ env.DOCKER_NAMESPACE}}/${{ env.DOCKER_REGISTRY_NAME }}"
+
+
+      # 1.3A Build and push image to Docker Hub
+      # 1.3A 构建并且推送镜像到docker hub
+      - name: Build and push Docker image
+        if: ${{   env.PUSH_REGISTRY_KIND == 'docker' ||   env.PUSH_REGISTRY_KIND == 'all' }}
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: "${{ env.DOCKER_NAMESPACE }}/${{ env.DOCKER_REGISTRY_NAME }}:${{ env.TAG }}"
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # 1.3B Build and push image to ACR
+      # 1.3B 构建并且推送镜像到阿里云ACR仓库
+      - name: Build and push image to ACR
+        if: ${{   env.PUSH_REGISTRY_KIND == 'ali' ||   env.PUSH_REGISTRY_KIND == 'all' }}
+        run: |
+          docker build --tag "$INSTANCE_ID.$REGISTRY/$NAMESPACE/$IMAGE:$TAG" .
+          docker push "$INSTANCE_ID.$REGISTRY/$NAMESPACE/$IMAGE:$TAG"
+
+
+      # 2.1 Set ACK context
+      # 2.1 设置链接ACK
+      - name: Set K8s context
+        uses: aliyun/ack-set-context@v1
+        with:
+          access-key-id: "${{ secrets.ACCESS_KEY_ID }}"
+          access-key-secret: "${{ secrets.ACCESS_KEY_SECRET }}"
+          cluster-type: 'ACK'
+          cluster-id: "${{ env.ACK_CLUSTER_ID }}"
+
+      # 2.2A Deploy to ACK with ali image
+      # 2.2A 使用阿里云ACR仓库的镜像部署
+      - name: Deploy of ali image
+        if: ${{  env.PUSH_REGISTRY_KIND == 'ali' ||  env.PUSH_REGISTRY_KIND == 'all' }}
+        run: |-
+          envsubst < deployment-ali.yaml > deployment-ali.rendered.yaml
+          envsubst < svc.yaml > svc.rendered.yaml
+          kubectl apply -f ./deployment-ali.rendered.yaml
+          kubectl apply -f ./svc.rendered.yaml
+          kubectl rollout status deployment/$ACK_DEPLOYMENT_NAME
+          kubectl get services -o wide
+          
+        
+      # 2.2B Deploy to ACK with docker hub image
+      # 2.2B 使用docker hub仓库的镜像部署
+
+      - name: Deploy of docker hub failure
+        if: ${{  env.PUSH_REGISTRY_KIND == 'docker' }}
+        run: |-
+          envsubst < deployment-docker-hub.yaml > deployment-docker-hub.rendered.yaml
+          envsubst < svc.yaml > svc.rendered.yaml
+          kubectl apply -f ./deployment-docker-hub.rendered.yaml
+          kubectl apply -f ./svc.rendered.yaml
+          kubectl rollout status deployment/$ACK_DEPLOYMENT_NAME
+          kubectl get services -o wide
